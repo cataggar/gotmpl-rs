@@ -648,7 +648,8 @@ impl<'a> Executor<'a> {
         }
 
         // If the first arg is a Chain with an Identifier inside, it's a function call
-        // with field access on the result (e.g., mapOfThree.three)
+        // with field access on the result (e.g., mapOfThree.three), or a zero-arg
+        // function returning a Map with a method field invoked with args/piped value.
         if let Expr::Chain(_, inner, fields) = first
             && let Expr::Identifier(_, name) = inner.as_ref()
         {
@@ -656,13 +657,52 @@ impl<'a> Executor<'a> {
                 let val = self.eval_short_circuit(dot, name, &cmd.args[1..], piped)?;
                 return self.walk_fields(val, fields);
             }
+            if cmd.args.len() == 1 && piped.is_none() {
+                let val = self.eval_function_call(dot, name, &[], None)?;
+                return self.walk_fields(val, fields);
+            }
+            if let Ok(val) = self.eval_function_call(dot, name, &[], None)
+                && let Ok((callee_name, Value::Function(func))) = self.walk_fields_raw(val, fields)
+            {
+                let mut args: Vec<Value> =
+                    Vec::with_capacity(cmd.args.len() - 1 + usize::from(piped.is_some()));
+                for expr in &cmd.args[1..] {
+                    args.push(self.eval_expr(dot, expr)?);
+                }
+                if let Some(piped_val) = piped {
+                    args.push(piped_val);
+                }
+                return self.invoke_func(callee_name.as_deref().unwrap_or("<func>"), &func, &args);
+            }
             let val = self.eval_function_call(dot, name, &cmd.args[1..], piped)?;
             return self.walk_fields(val, fields);
         }
 
-        // Non-function command: cannot accept piped values or extra arguments.
-        // Go errors with "can't give argument to non-function".
+        // Non-function command: if `first` is a field, variable, or chain, check
+        // whether it resolves to a `Value::Function` that can accept arguments
+        // or a piped value (method invocation on `Value::Map` or variable).
         if piped.is_some() || cmd.args.len() > 1 {
+            if matches!(
+                first,
+                Expr::Field(_, _) | Expr::Variable(_, _, _) | Expr::Chain(_, _, _)
+            ) {
+                let (callee_name, target) = self.eval_callable_expr(dot, first)?;
+                if let Value::Function(func) = target {
+                    let mut args: Vec<Value> =
+                        Vec::with_capacity(cmd.args.len() - 1 + usize::from(piped.is_some()));
+                    for expr in &cmd.args[1..] {
+                        args.push(self.eval_expr(dot, expr)?);
+                    }
+                    if let Some(piped_val) = piped {
+                        args.push(piped_val);
+                    }
+                    return self.invoke_func(
+                        callee_name.as_deref().unwrap_or("<func>"),
+                        &func,
+                        &args,
+                    );
+                }
+            }
             return Err(TemplateError::Exec(format!(
                 "can't give argument to non-function {}",
                 expr_name(first)
@@ -744,8 +784,17 @@ impl<'a> Executor<'a> {
 
         let mut args: Vec<Value> =
             Vec::with_capacity(arg_exprs.len() + usize::from(piped.is_some()));
-        for expr in arg_exprs {
-            args.push(self.eval_expr(dot, expr)?);
+        if name == "call"
+            && let Some((first_arg, rest_args)) = arg_exprs.split_first()
+        {
+            args.push(self.eval_callable_expr(dot, first_arg)?.1);
+            for expr in rest_args {
+                args.push(self.eval_expr(dot, expr)?);
+            }
+        } else {
+            for expr in arg_exprs {
+                args.push(self.eval_expr(dot, expr)?);
+            }
         }
 
         // Piped value becomes the last argument (Go convention)
@@ -764,8 +813,60 @@ impl<'a> Executor<'a> {
         Ok(val)
     }
 
-    /// Access a field on a value, respecting missingkey option.
-    fn field_access(&self, val: &Value, name: &str) -> ExecResult<Value> {
+    /// Walk a chain of field accesses on `val`, evaluating intermediate zero-arg
+    /// methods via [`Self::field_access`] and leaving the terminal field raw via
+    /// [`Self::field_access_raw`] so a terminal `Value::Function` can be invoked
+    /// with arguments.
+    fn walk_fields_raw(
+        &self,
+        mut val: Value,
+        fields: &[SmolStr],
+    ) -> ExecResult<(Option<SmolStr>, Value)> {
+        let Some((last, prefix)) = fields.split_last() else {
+            return Ok((None, val));
+        };
+        for field in prefix {
+            val = self.field_access(&val, field)?;
+        }
+        let terminal = self.field_access_raw(&val, last)?;
+        Ok((Some(last.clone()), terminal))
+    }
+
+    /// Evaluate an expression in callable position, preserving a terminal
+    /// `Value::Function` without auto-invoking it as a 0-arg method.
+    fn eval_callable_expr(
+        &mut self,
+        dot: &Value,
+        expr: &Expr,
+    ) -> ExecResult<(Option<SmolStr>, Value)> {
+        match expr {
+            Expr::Field(_, fields) => self.walk_fields_raw(dot.clone(), fields),
+            Expr::Variable(_, name, fields) => {
+                let val = self
+                    .vars
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| TemplateError::UndefinedVariable(name.to_string()))?;
+                if fields.is_empty() {
+                    Ok((Some(name.clone()), val))
+                } else {
+                    self.walk_fields_raw(val, fields)
+                }
+            }
+            Expr::Chain(_, inner, fields) => {
+                let val = if let Expr::Identifier(_, name) = inner.as_ref() {
+                    self.eval_function_call(dot, name, &[], None)?
+                } else {
+                    self.eval_expr(dot, inner)?
+                };
+                self.walk_fields_raw(val, fields)
+            }
+            other => self.eval_expr(dot, other).map(|v| (None, v)),
+        }
+    }
+
+    /// Access a field on a value without invoking `Value::Function` entries.
+    fn field_access_raw(&self, val: &Value, name: &str) -> ExecResult<Value> {
         match val.field(name) {
             Some(v) => Ok(v.clone()),
             None if matches!(val, Value::Map(_)) => match self.missing_key {
@@ -782,6 +883,15 @@ impl<'a> Executor<'a> {
                 val.type_name()
             ))
             .into()),
+        }
+    }
+
+    /// Access a field on a value, respecting missingkey option and invoking
+    /// zero-argument `Value::Function` entries.
+    fn field_access(&self, val: &Value, name: &str) -> ExecResult<Value> {
+        match self.field_access_raw(val, name)? {
+            Value::Function(func) => self.invoke_func(name, &func, &[]),
+            other => Ok(other),
         }
     }
 

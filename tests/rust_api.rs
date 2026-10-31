@@ -993,6 +993,139 @@ fn test_method_substitute_chained_call_propagates_error() {
     assert!(err.to_string().contains("middle failed"), "got: {err}");
 }
 
+#[test]
+fn test_map_method_root_with_args_and_if() {
+    let get_fn: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(k)) if k.as_ref() == "host" => Ok(Value::String("localhost".into())),
+        _ => Ok(Value::Nil),
+    });
+    let has_fn: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(k)) => Ok(Value::Bool(k.as_ref() == "tls")),
+        _ => Ok(Value::Bool(false)),
+    });
+    let data = tmap! {
+        "Get" => Value::Function(get_fn),
+        "Has" => Value::Function(has_fn),
+    };
+    let out = Template::new("t")
+        .parse(r#"{{ .Get "host" }}:{{ if .Has "tls" }}https{{ else }}http{{ end }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "localhost:https");
+}
+
+#[test]
+fn test_map_method_piped_argument() {
+    let get_fn: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(k)) if k.as_ref() == "host" => Ok(Value::String("example.com".into())),
+        _ => Ok(Value::Nil),
+    });
+    let data = tmap! { "Get" => Value::Function(get_fn) };
+    let out = Template::new("t")
+        .parse(r#"{{ "host" | .Get }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "example.com");
+}
+
+#[test]
+fn test_map_method_nested_map() {
+    let version_eq: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(v)) => Ok(Value::Bool(v.as_ref() == "24.04")),
+        _ => Ok(Value::Bool(false)),
+    });
+    let data = tmap! {
+        "Env" => tmap! {
+            "OS" => tmap! {
+                "VersionEq" => Value::Function(version_eq),
+            },
+        },
+    };
+    let out = Template::new("t")
+        .parse(r#"{{ if .Env.OS.VersionEq "24.04" }}noble{{ else }}other{{ end }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "noble");
+}
+
+#[test]
+fn test_map_method_on_variable() {
+    let format_fn: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(name)) => Ok(Value::String(format!("Hello, {name}!").into())),
+        _ => Ok(Value::Nil),
+    });
+    let data = tmap! {
+        "Helper" => tmap! {
+            "Format" => Value::Function(format_fn),
+        },
+        "Name" => "Alice",
+    };
+    let out = Template::new("t")
+        .parse(r#"{{ $helper := .Helper }}{{ $helper.Format .Name }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "Hello, Alice!");
+}
+
+#[test]
+fn test_map_method_parenthesized_chain() {
+    let get_fn: gotmpl::ValueFunc = Arc::new(|args| match args.first() {
+        Some(Value::String(k)) if k.as_ref() == "host" => Ok(Value::String("db.internal".into())),
+        _ => Ok(Value::Nil),
+    });
+    let data = tmap! {
+        "Env" => tmap! {
+            "Get" => Value::Function(get_fn),
+        },
+    };
+    let out = Template::new("t")
+        .parse(r#"{{ (.Env).Get "host" }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "db.internal");
+}
+
+#[test]
+fn test_map_method_zero_arg_terminal_and_intermediate() {
+    let title_fn: gotmpl::ValueFunc = Arc::new(|args| {
+        assert!(args.is_empty());
+        Ok(Value::String("My Page".into()))
+    });
+    let get_env_fn: gotmpl::ValueFunc = Arc::new(|args| {
+        assert!(args.is_empty());
+        Ok(tmap! { "Host" => "api.local" })
+    });
+    let data = tmap! {
+        "Title" => Value::Function(title_fn),
+        "GetEnv" => Value::Function(get_env_fn),
+    };
+    let out = Template::new("t")
+        .parse(r#"{{ .Title }}|{{ printf "%s" .Title }}|{{ .GetEnv.Host }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "My Page|My Page|api.local");
+}
+
+#[test]
+fn test_map_non_function_field_with_arg_errors() {
+    let data = tmap! { "Title" => "Static Title" };
+    let err = Template::new("t")
+        .parse(r#"{{ .Title "extra" }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "execution error: can't give argument to non-function <field>"
+    );
+}
+
 // Multi-step template cycles (Phase 8.3).
 //
 // Single self-recursive template depth is already covered by
