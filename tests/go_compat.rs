@@ -111,7 +111,7 @@ mod go_crosscheck {
                 }
                 format!(r#"{{"type":"map","map":{{{}}}}}"#, entries.join(","))
             }
-            Value::Function(_) => {
+            Value::Function(_) | Value::ContextFunction(_) => {
                 return Err("Value::Function cannot be serialized for cross-check; use \
                      Template::new(...).func(...).parse(...).execute_to_string(...) \
                      directly in a #[test] fn instead of ok()/fail()");

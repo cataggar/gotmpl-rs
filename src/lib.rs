@@ -93,7 +93,7 @@ pub use go::{html_escape, js_escape, url_encode};
 pub use ser::{ToSerdeValue, to_value};
 #[cfg(feature = "html")]
 pub use value::SafeKind;
-pub use value::{ToValue, Value, ValueFunc};
+pub use value::{ToValue, Value, ValueContextFunc, ValueFunc};
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -105,7 +105,7 @@ use alloc::vec::Vec;
 use std::io::Write;
 
 use exec::Executor;
-pub use exec::MissingKey;
+pub use exec::{CallContext, MissingKey};
 use parse::{DefineNode, ListNode, Parser};
 
 /// A map from function names to template functions, equivalent to Go's
@@ -742,11 +742,12 @@ impl Template {
     /// this template's execution options. Single place all execute paths route
     /// through so a new option cannot be forgotten on one of them.
     fn make_executor<'a>(
-        &self,
+        &'a self,
         funcs: &'a BTreeMap<String, ValueFunc>,
         templates: &'a BTreeMap<String, Arc<ListNode>>,
     ) -> Executor<'a> {
         let mut executor = Executor::new(funcs, templates);
+        executor.set_delims(&self.left_delim, &self.right_delim);
         executor.set_missing_key(self.missing_key);
         executor.set_max_range_iters(self.max_range_iters);
         executor

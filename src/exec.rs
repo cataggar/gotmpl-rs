@@ -33,9 +33,10 @@ use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::error::{Result, TemplateError};
-use crate::parse::{BranchNode, CommandNode, Expr, ListNode, Node, Number, PipeNode, TemplateNode};
-use crate::value::Value;
-use crate::value::ValueFunc;
+use crate::parse::{
+    BranchNode, CommandNode, Expr, ListNode, Node, Number, Parser, PipeNode, TemplateNode,
+};
+use crate::value::{Value, ValueContextFunc, ValueFunc};
 
 /// Maximum total recursion depth across `{{template}}` invocations and
 /// nested `{{if}}`/`{{with}}`/`{{range}}` bodies during execution.
@@ -134,6 +135,18 @@ impl From<core::fmt::Error> for ExecSignal {
     }
 }
 
+impl ExecSignal {
+    fn into_error(self) -> TemplateError {
+        match self {
+            ExecSignal::Err(e) => *e,
+            ExecSignal::Break => TemplateError::Exec("unexpected break outside of range".into()),
+            ExecSignal::Continue => {
+                TemplateError::Exec("unexpected continue outside of range".into())
+            }
+        }
+    }
+}
+
 /// Internal result alias used by the executor's private methods.
 type ExecResult<T> = core::result::Result<T, ExecSignal>;
 
@@ -207,6 +220,96 @@ pub struct Executor<'a> {
     depth: usize,
     missing_key: MissingKey,
     range_iters_remaining: u64,
+    left_delim: &'a str,
+    right_delim: &'a str,
+}
+
+/// Execution context passed to [`Value::ContextFunction`] callbacks
+/// (created via [`Value::context_func`]).
+///
+/// Provides access to the running [`Executor`] so context-aware functions
+/// can dynamically invoke named sub-templates
+/// ([`execute_template`](Self::execute_template)) or parse and evaluate
+/// template snippets on the fly ([`render_str`](Self::render_str)) while
+/// sharing the caller's template definitions, function map, delimiters,
+/// recursion depth counter, and `{{range}}` iteration budget.
+pub struct CallContext<'a, 'b> {
+    executor: core::cell::RefCell<&'a mut Executor<'b>>,
+}
+
+impl<'a, 'b> CallContext<'a, 'b> {
+    pub(crate) fn new(executor: &'a mut Executor<'b>) -> Self {
+        Self {
+            executor: core::cell::RefCell::new(executor),
+        }
+    }
+
+    /// Execute a named template defined on the active [`Template`](crate::Template)
+    /// with `dot` as `.` and `$`, returning the rendered output.
+    ///
+    /// Shares the caller's recursion depth counter and `{{range}}` iteration
+    /// budget, and isolates template variables (`$foo`) in a fresh scope
+    /// (matching Go's `{{template "name" dot}}` semantics).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TemplateError::UndefinedTemplate`] if `name` is not defined,
+    /// [`TemplateError::RecursionLimit`] if recursion depth exceeds the limit,
+    /// or any execution error produced by the sub-template.
+    pub fn execute_template(&self, name: &str, dot: &Value) -> Result<String> {
+        let mut exec = self
+            .executor
+            .try_borrow_mut()
+            .map_err(|_| TemplateError::Exec("concurrent CallContext borrow".into()))?;
+        exec.depth += 1;
+        let result = exec.check_depth().and_then(|()| {
+            let tree = Arc::clone(
+                exec.templates
+                    .get(name)
+                    .ok_or_else(|| TemplateError::UndefinedTemplate(name.to_string()))?,
+            );
+            let saved = core::mem::replace(&mut exec.vars, VarScope::new());
+            exec.vars.set(&DOLLAR_KEY, dot.clone());
+            let mut buf = String::new();
+            let walk_res = exec.walk(&mut buf, &tree, dot);
+            exec.vars = saved;
+            walk_res.map(|()| buf)
+        });
+        exec.depth -= 1;
+        result.map_err(ExecSignal::into_error)
+    }
+
+    /// Parse and execute a template snippet `src` on the fly with `dot` as
+    /// `.` and `$`, using the active template's delimiters, function map, and
+    /// named template definitions.
+    ///
+    /// Shares the caller's recursion depth counter and `{{range}}` iteration
+    /// budget, and isolates template variables in a fresh scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lex/parse error if `src` is malformed,
+    /// [`TemplateError::RecursionLimit`] if recursion depth exceeds the limit,
+    /// or any execution error produced while evaluating `src`.
+    pub fn render_str(&self, src: &str, dot: &Value) -> Result<String> {
+        let mut exec = self
+            .executor
+            .try_borrow_mut()
+            .map_err(|_| TemplateError::Exec("concurrent CallContext borrow".into()))?;
+        exec.depth += 1;
+        let result = exec.check_depth().and_then(|()| {
+            let parser = Parser::with_name(None, src, exec.left_delim, exec.right_delim)?;
+            let (tree, _defines) = parser.parse()?;
+            let saved = core::mem::replace(&mut exec.vars, VarScope::new());
+            exec.vars.set(&DOLLAR_KEY, dot.clone());
+            let mut buf = String::new();
+            let walk_res = exec.walk(&mut buf, &tree, dot);
+            exec.vars = saved;
+            walk_res.map(|()| buf)
+        });
+        exec.depth -= 1;
+        result.map_err(ExecSignal::into_error)
+    }
 }
 
 /// Returns a short human-readable name for an expression, used in error messages.
@@ -310,7 +413,16 @@ impl<'a> Executor<'a> {
             depth: 0,
             missing_key: MissingKey::default(),
             range_iters_remaining: DEFAULT_MAX_RANGE_ITERS,
+            left_delim: "{{",
+            right_delim: "}}",
         }
+    }
+
+    /// Set the action delimiters used when parsing template snippets at runtime
+    /// via [`CallContext::render_str`].
+    pub fn set_delims(&mut self, left: &'a str, right: &'a str) {
+        self.left_delim = left;
+        self.right_delim = right;
     }
 
     /// Set the [`MissingKey`] behavior for this executor.
@@ -339,13 +451,7 @@ impl<'a> Executor<'a> {
         dot: &Value,
     ) -> Result<()> {
         self.vars.set(&DOLLAR_KEY, dot.clone());
-        self.walk(writer, tree, dot).map_err(|sig| match sig {
-            ExecSignal::Err(e) => *e,
-            ExecSignal::Break => TemplateError::Exec("unexpected break outside of range".into()),
-            ExecSignal::Continue => {
-                TemplateError::Exec("unexpected continue outside of range".into())
-            }
-        })
+        self.walk(writer, tree, dot).map_err(ExecSignal::into_error)
     }
 
     // AST walker
@@ -661,46 +767,59 @@ impl<'a> Executor<'a> {
                 let val = self.eval_function_call(dot, name, &[], None)?;
                 return self.walk_fields(val, fields);
             }
-            if let Ok(val) = self.eval_function_call(dot, name, &[], None)
-                && let Ok((callee_name, Value::Function(func))) = self.walk_fields_raw(val, fields)
-            {
-                let mut args: Vec<Value> =
-                    Vec::with_capacity(cmd.args.len() - 1 + usize::from(piped.is_some()));
-                for expr in &cmd.args[1..] {
-                    args.push(self.eval_expr(dot, expr)?);
+            if let Ok(val) = self.eval_function_call(dot, name, &[], None) {
+                match self.walk_fields_raw(val, fields) {
+                    Ok((callee_name, Value::Function(func))) => {
+                        let args = self.eval_method_args(dot, &cmd.args[1..], piped)?;
+                        return self.invoke_func(
+                            callee_name.as_deref().unwrap_or("<func>"),
+                            &func,
+                            &args,
+                        );
+                    }
+                    Ok((callee_name, Value::ContextFunction(func))) => {
+                        let args = self.eval_method_args(dot, &cmd.args[1..], piped)?;
+                        return self.invoke_context_func(
+                            callee_name.as_deref().unwrap_or("<func>"),
+                            &func,
+                            &args,
+                        );
+                    }
+                    _ => {}
                 }
-                if let Some(piped_val) = piped {
-                    args.push(piped_val);
-                }
-                return self.invoke_func(callee_name.as_deref().unwrap_or("<func>"), &func, &args);
             }
             let val = self.eval_function_call(dot, name, &cmd.args[1..], piped)?;
             return self.walk_fields(val, fields);
         }
 
         // Non-function command: if `first` is a field, variable, or chain, check
-        // whether it resolves to a `Value::Function` that can accept arguments
-        // or a piped value (method invocation on `Value::Map` or variable).
+        // whether it resolves to a `Value::Function` or `Value::ContextFunction`
+        // that can accept arguments or a piped value (method invocation on
+        // `Value::Map` or variable).
         if piped.is_some() || cmd.args.len() > 1 {
             if matches!(
                 first,
                 Expr::Field(_, _) | Expr::Variable(_, _, _) | Expr::Chain(_, _, _)
             ) {
                 let (callee_name, target) = self.eval_callable_expr(dot, first)?;
-                if let Value::Function(func) = target {
-                    let mut args: Vec<Value> =
-                        Vec::with_capacity(cmd.args.len() - 1 + usize::from(piped.is_some()));
-                    for expr in &cmd.args[1..] {
-                        args.push(self.eval_expr(dot, expr)?);
+                match target {
+                    Value::Function(func) => {
+                        let args = self.eval_method_args(dot, &cmd.args[1..], piped)?;
+                        return self.invoke_func(
+                            callee_name.as_deref().unwrap_or("<func>"),
+                            &func,
+                            &args,
+                        );
                     }
-                    if let Some(piped_val) = piped {
-                        args.push(piped_val);
+                    Value::ContextFunction(func) => {
+                        let args = self.eval_method_args(dot, &cmd.args[1..], piped)?;
+                        return self.invoke_context_func(
+                            callee_name.as_deref().unwrap_or("<func>"),
+                            &func,
+                            &args,
+                        );
                     }
-                    return self.invoke_func(
-                        callee_name.as_deref().unwrap_or("<func>"),
-                        &func,
-                        &args,
-                    );
+                    _ => {}
                 }
             }
             return Err(TemplateError::Exec(format!(
@@ -802,11 +921,35 @@ impl<'a> Executor<'a> {
             args.push(piped_val);
         }
 
+        if name == "call"
+            && let Some(Value::ContextFunction(ctx_func)) = args.first()
+        {
+            let ctx_func = Arc::clone(ctx_func);
+            return self.invoke_context_func(name, &ctx_func, &args[1..]);
+        }
+
         self.invoke_func(name, func, &args)
     }
 
+    fn eval_method_args(
+        &mut self,
+        dot: &Value,
+        arg_exprs: &[Expr],
+        piped: Option<Value>,
+    ) -> ExecResult<Vec<Value>> {
+        let mut args: Vec<Value> =
+            Vec::with_capacity(arg_exprs.len() + usize::from(piped.is_some()));
+        for expr in arg_exprs {
+            args.push(self.eval_expr(dot, expr)?);
+        }
+        if let Some(piped_val) = piped {
+            args.push(piped_val);
+        }
+        Ok(args)
+    }
+
     /// Walk a chain of field accesses on `val`.
-    fn walk_fields(&self, mut val: Value, fields: &[SmolStr]) -> ExecResult<Value> {
+    fn walk_fields(&mut self, mut val: Value, fields: &[SmolStr]) -> ExecResult<Value> {
         for field in fields {
             val = self.field_access(&val, field)?;
         }
@@ -815,10 +958,10 @@ impl<'a> Executor<'a> {
 
     /// Walk a chain of field accesses on `val`, evaluating intermediate zero-arg
     /// methods via [`Self::field_access`] and leaving the terminal field raw via
-    /// [`Self::field_access_raw`] so a terminal `Value::Function` can be invoked
-    /// with arguments.
+    /// [`Self::field_access_raw`] so a terminal `Value::Function` or
+    /// `Value::ContextFunction` can be invoked with arguments.
     fn walk_fields_raw(
-        &self,
+        &mut self,
         mut val: Value,
         fields: &[SmolStr],
     ) -> ExecResult<(Option<SmolStr>, Value)> {
@@ -833,7 +976,8 @@ impl<'a> Executor<'a> {
     }
 
     /// Evaluate an expression in callable position, preserving a terminal
-    /// `Value::Function` without auto-invoking it as a 0-arg method.
+    /// `Value::Function` or `Value::ContextFunction` without auto-invoking it
+    /// as a 0-arg method.
     fn eval_callable_expr(
         &mut self,
         dot: &Value,
@@ -865,7 +1009,8 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Access a field on a value without invoking `Value::Function` entries.
+    /// Access a field on a value without invoking `Value::Function` or
+    /// `Value::ContextFunction` entries.
     fn field_access_raw(&self, val: &Value, name: &str) -> ExecResult<Value> {
         match val.field(name) {
             Some(v) => Ok(v.clone()),
@@ -887,10 +1032,11 @@ impl<'a> Executor<'a> {
     }
 
     /// Access a field on a value, respecting missingkey option and invoking
-    /// zero-argument `Value::Function` entries.
-    fn field_access(&self, val: &Value, name: &str) -> ExecResult<Value> {
+    /// zero-argument `Value::Function` and `Value::ContextFunction` entries.
+    fn field_access(&mut self, val: &Value, name: &str) -> ExecResult<Value> {
         match self.field_access_raw(val, name)? {
             Value::Function(func) => self.invoke_func(name, &func, &[]),
+            Value::ContextFunction(func) => self.invoke_context_func(name, &func, &[]),
             other => Ok(other),
         }
     }
@@ -910,6 +1056,37 @@ impl<'a> Executor<'a> {
     #[cfg(not(feature = "std"))]
     fn invoke_func(&self, _name: &str, func: &ValueFunc, args: &[Value]) -> ExecResult<Value> {
         func(args).map_err(ExecSignal::from)
+    }
+
+    #[cfg(feature = "std")]
+    fn invoke_context_func(
+        &mut self,
+        name: &str,
+        func: &ValueContextFunc,
+        args: &[Value],
+    ) -> ExecResult<Value> {
+        match catch_unwind(AssertUnwindSafe(|| {
+            let ctx = CallContext::new(self);
+            func(&ctx, args)
+        })) {
+            Ok(result) => result.map_err(ExecSignal::from),
+            Err(payload) => Err(TemplateError::FuncPanic {
+                name: name.to_string(),
+                message: panic_payload_to_string(payload),
+            }
+            .into()),
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn invoke_context_func(
+        &mut self,
+        _name: &str,
+        func: &ValueContextFunc,
+        args: &[Value],
+    ) -> ExecResult<Value> {
+        let ctx = CallContext::new(self);
+        func(&ctx, args).map_err(ExecSignal::from)
     }
 
     fn eval_expr(&mut self, dot: &Value, expr: &Expr) -> ExecResult<Value> {

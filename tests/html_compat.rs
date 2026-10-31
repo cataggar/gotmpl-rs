@@ -102,7 +102,9 @@ mod go_crosscheck {
                 }
                 format!(r#"{{"type":"map","map":{{{}}}}}"#, entries.join(","))
             }
-            Value::Function(_) => return Err("Value::Function cannot be serialized".into()),
+            Value::Function(_) | Value::ContextFunction(_) => {
+                return Err("Value::Function cannot be serialized".into());
+            }
         })
     }
 
