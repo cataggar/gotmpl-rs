@@ -315,6 +315,9 @@ pub fn builtins() -> BTreeMap<String, ValueFunc> {
         }),
     );
 
+    #[cfg(feature = "sprig")]
+    m.extend(crate::sprig::funcs());
+
     m
 }
 
@@ -353,7 +356,7 @@ fn stringify_for_escaper(v: &Value) -> Cow<'_, str> {
 }
 
 // Argument validation helpers
-fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
+pub(crate) fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
     if args.len() != expected {
         return Err(TemplateError::ArgCount {
             name: name.to_string(),

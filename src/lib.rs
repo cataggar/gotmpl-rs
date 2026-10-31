@@ -47,6 +47,15 @@ pub mod ser;
 #[cfg_attr(docsrs, doc(cfg(feature = "html")))]
 pub mod html;
 
+/// Sprig-compatible template utility functions.
+///
+/// Available with the `sprig` feature (enabled by default). Functions in
+/// this module are automatically registered on [`Template::new`], and can
+/// also be obtained directly via [`sprig::funcs`].
+#[cfg(feature = "sprig")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sprig")))]
+pub mod sprig;
+
 // Public re-exports
 // All user-facing types are available at the crate root.
 
