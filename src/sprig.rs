@@ -93,7 +93,7 @@ fn to_json_fn(args: &[Value]) -> Result<Value> {
 
 fn write_json(v: &Value, out: &mut String) {
     match v {
-        Value::Nil | Value::Function(_) => out.push_str("null"),
+        Value::Nil | Value::Function(_) | Value::ContextFunction(_) => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Int(n) => {

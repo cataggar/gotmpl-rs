@@ -586,7 +586,7 @@ fn json_encode(v: &Value, out: &mut String) {
         }
         // Go's json.Marshal cannot encode a func; it returns an error. We emit
         // `null` so the surrounding script stays syntactically valid.
-        Value::Function(_) => out.push_str("null"),
+        Value::Function(_) | Value::ContextFunction(_) => out.push_str("null"),
     }
 }
 

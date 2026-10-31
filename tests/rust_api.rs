@@ -1895,3 +1895,223 @@ fn test_uint_usize_max_to_value() {
     use gotmpl::ToValue;
     assert_eq!(usize::MAX.to_value(), Value::Uint(usize::MAX as u64));
 }
+
+// Value::context_func and CallContext (Issue #1: dynamic sub-template invocation & runtime snippet expansion).
+
+fn make_call_template_fn() -> Value {
+    Value::context_func(|ctx, args| {
+        let name = args.first().and_then(Value::as_str).ok_or_else(|| {
+            gotmpl::TemplateError::Exec("CallTemplate: expected template name string".into())
+        })?;
+        let dot = args.get(1).unwrap_or(&Value::Nil);
+        let rendered = ctx.execute_template(name, dot)?;
+        Ok(Value::String(rendered.into()))
+    })
+}
+
+fn make_param_expand_fn() -> Value {
+    Value::context_func(|ctx, args| {
+        let src = args.first().and_then(Value::as_str).ok_or_else(|| {
+            gotmpl::TemplateError::Exec("ParamExpand: expected template string".into())
+        })?;
+        let dot = args.get(1).unwrap_or(&Value::Nil);
+        let rendered = ctx.render_str(src, dot)?;
+        Ok(Value::String(rendered.into()))
+    })
+}
+
+#[test]
+fn test_context_func_call_template_dynamic_name() {
+    let tmpl_src = concat!(
+        r#"{{ define "layout-card.tmpl" }}<div class="card">{{ .Title }} (root={{ $.Title }})</div>{{ end }}"#,
+        r#"{{ $partial := printf "layout-%s.tmpl" .Kind }}"#,
+        r#"{{ .CallTemplate $partial . }}"#,
+    );
+    let data = tmap! {
+        "Kind" => "card",
+        "Title" => "Welcome",
+        "CallTemplate" => make_call_template_fn(),
+    };
+    let out = Template::new("page")
+        .parse(tmpl_src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, r#"<div class="card">Welcome (root=Welcome)</div>"#);
+}
+
+#[test]
+fn test_context_func_call_template_scope_isolation() {
+    // Caller's `$caller_only` must not leak into the sub-template; inside the
+    // sub-template `$` is bound to the passed `dot` argument, and the caller's
+    // variables remain intact after `.CallTemplate` returns.
+    let ok_src = concat!(
+        r#"{{ define "sub.tmpl" }}{{ $sub_var := "inner" }}[sub dot={{ .Item }} dollar={{ $.Item }} local={{ $sub_var }}]{{ end }}"#,
+        r#"{{ $partial := "sub.tmpl" }}"#,
+        r#"{{ $sub_var := "outer" }}"#,
+        r#"{{ .CallTemplate $partial .Child }}|after={{ $partial }}:{{ $sub_var }}"#,
+    );
+    let data = tmap! {
+        "Child" => tmap! { "Item" => "leaf" },
+        "CallTemplate" => make_call_template_fn(),
+    };
+    let out = Template::new("page")
+        .parse(ok_src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(
+        out,
+        "[sub dot=leaf dollar=leaf local=inner]|after=sub.tmpl:outer"
+    );
+
+    // Referencing the caller's `$partial` inside the sub-template must fail
+    // with UndefinedVariable.
+    let leak_src = concat!(
+        r#"{{ define "leak.tmpl" }}{{ $partial }}{{ end }}"#,
+        r#"{{ $partial := "leak.tmpl" }}"#,
+        r#"{{ .CallTemplate $partial . }}"#,
+    );
+    let err = Template::new("page")
+        .parse(leak_src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        matches!(err, gotmpl::TemplateError::UndefinedVariable(ref v) if v == "$partial"),
+        "expected UndefinedVariable($partial), got {err:?}"
+    );
+}
+
+#[test]
+fn test_context_func_call_template_undefined_error() {
+    let data = tmap! {
+        "CallTemplate" => make_call_template_fn(),
+    };
+    let err = Template::new("page")
+        .parse(r#"{{ .CallTemplate "missing.tmpl" . }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        matches!(err, gotmpl::TemplateError::UndefinedTemplate(ref name) if name == "missing.tmpl"),
+        "expected UndefinedTemplate(missing.tmpl), got {err:?}"
+    );
+}
+
+#[test]
+fn test_context_func_call_template_recursion_limit() {
+    let src = concat!(
+        r#"{{ define "loop.tmpl" }}{{ .CallTemplate "loop.tmpl" . }}{{ end }}"#,
+        r#"{{ .CallTemplate "loop.tmpl" . }}"#,
+    );
+    let data = tmap! {
+        "CallTemplate" => make_call_template_fn(),
+    };
+    let err = Template::new("page")
+        .parse(src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        matches!(err, gotmpl::TemplateError::RecursionLimit),
+        "expected RecursionLimit, got {err:?}"
+    );
+}
+
+#[test]
+fn test_context_func_call_template_shares_max_range_iters_budget() {
+    let src = concat!(
+        r#"{{ define "three.tmpl" }}{{ range 3 }}x{{ end }}{{ end }}"#,
+        r#"{{ .CallTemplate "three.tmpl" . }}{{ .CallTemplate "three.tmpl" . }}"#,
+    );
+    let data = tmap! {
+        "CallTemplate" => make_call_template_fn(),
+    };
+    // Budget of 5 across the whole execution: first call uses 3, second uses 3 -> exceeds 5.
+    let err = Template::new("page")
+        .max_range_iters(5)
+        .parse(src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        matches!(err, gotmpl::TemplateError::RangeIterLimit),
+        "expected RangeIterLimit, got {err:?}"
+    );
+}
+
+#[test]
+fn test_context_func_param_expand_render_str() {
+    let data = tmap! {
+        "Host" => "db.internal",
+        "Port" => 5432i64,
+        "Endpoint" => "{{ .Host }}:{{ .Port }}",
+        "ParamExpand" => make_param_expand_fn(),
+    };
+    let out = Template::new("cfg")
+        .parse(r#"url={{ .ParamExpand .Endpoint . }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "url=db.internal:5432");
+}
+
+#[test]
+fn test_context_func_param_expand_respects_custom_delims() {
+    let data = tmap! {
+        "Host" => "cache.local",
+        "Port" => 6379i64,
+        "Endpoint" => "<< .Host >>:<< .Port >> ({{literal}})",
+        "ParamExpand" => make_param_expand_fn(),
+    };
+    let out = Template::new("cfg")
+        .delims("<<", ">>")
+        .parse(r#"url=<< .ParamExpand .Endpoint . >>"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "url=cache.local:6379 ({{literal}})");
+}
+
+#[test]
+fn test_context_func_param_expand_recursion_limit() {
+    let data = tmap! {
+        "Bomb" => "{{ .ParamExpand .Bomb . }}",
+        "ParamExpand" => make_param_expand_fn(),
+    };
+    let err = Template::new("cfg")
+        .parse(r#"{{ .ParamExpand .Bomb . }}"#)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap_err();
+    assert!(
+        matches!(err, gotmpl::TemplateError::RecursionLimit),
+        "expected RecursionLimit, got {err:?}"
+    );
+}
+
+#[test]
+fn test_context_func_via_call_builtin_and_zero_arg_method() {
+    let zero_arg = Value::context_func(|ctx, args| {
+        assert!(args.is_empty());
+        let s = ctx.execute_template("banner", &tmap! { "User" => "Root" })?;
+        Ok(Value::String(s.into()))
+    });
+    let data = tmap! {
+        "Title" => "Dashboard",
+        "CallTemplate" => make_call_template_fn(),
+        "Banner" => zero_arg,
+    };
+    let src = concat!(
+        r#"{{ define "banner" }}[hi {{ .User }}]{{ end }}"#,
+        r#"{{ define "sub" }}({{ .Title }}){{ end }}"#,
+        r#"{{ .Banner }}|{{ call .CallTemplate "sub" . }}"#,
+    );
+    let out = Template::new("t")
+        .parse(src)
+        .unwrap()
+        .execute_to_string(&data)
+        .unwrap();
+    assert_eq!(out, "[hi Root]|(Dashboard)");
+}

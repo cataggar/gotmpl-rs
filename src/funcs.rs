@@ -278,6 +278,9 @@ pub fn builtins() -> BTreeMap<String, ValueFunc> {
             check_min_args("call", args, 1)?;
             match &args[0] {
                 Value::Function(f) => f(&args[1..]),
+                Value::ContextFunction(_) => Err(TemplateError::Exec(
+                    "call: context function requires an active template executor".into(),
+                )),
                 Value::Nil => Err(TemplateError::Exec("call of nil".into())),
                 other => Err(TemplateError::Exec(format!(
                     "call: non-function value of type {}",
@@ -393,7 +396,10 @@ fn compare_eq(left: &Value, right: &Value) -> Result<bool> {
         (Value::String(a), Value::String(b)) => Ok(a == b),
         (Value::List(_), Value::List(_))
         | (Value::Map(_), Value::Map(_))
-        | (Value::Function(_), Value::Function(_)) => Err(TemplateError::Exec(format!(
+        | (
+            Value::Function(_) | Value::ContextFunction(_),
+            Value::Function(_) | Value::ContextFunction(_),
+        ) => Err(TemplateError::Exec(format!(
             "non-comparable type {}",
             left.type_name()
         ))),

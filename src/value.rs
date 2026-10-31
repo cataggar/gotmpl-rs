@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::error::Result;
+use crate::exec::CallContext;
 
 /// Alias for a callable function stored inside [`Value::Function`].
 ///
@@ -47,6 +48,14 @@ use crate::error::Result;
 /// assert_eq!(result, Value::Int(5));
 /// ```
 pub type ValueFunc = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
+
+/// Alias for a context-aware callable function stored inside [`Value::ContextFunction`].
+///
+/// Receives the active [`CallContext`] alongside its argument slice so the
+/// closure can invoke named sub-templates or render template snippets during
+/// execution.
+pub type ValueContextFunc =
+    Arc<dyn for<'a, 'b> Fn(&CallContext<'a, 'b>, &[Value]) -> Result<Value> + Send + Sync>;
 
 /// The dynamic type for template data.
 ///
@@ -106,10 +115,18 @@ pub enum Value {
     /// and to let `{{range}}` over a map refcount-bump the key into
     /// [`Value::String`] instead of allocating.
     Map(Arc<BTreeMap<Arc<str>, Value>>),
-    /// A callable function value, invoked via the `call` builtin.
+    /// A callable function value, invoked as a method on a [`Value::Map`] or
+    /// via the `call` builtin.
     ///
     /// See [`ValueFunc`] for the expected signature.
     Function(ValueFunc),
+    /// A context-aware callable function value that receives a [`CallContext`]
+    /// alongside its arguments when invoked as a method on a [`Value::Map`] or
+    /// via the `call` builtin.
+    ///
+    /// Construct via [`Value::context_func`]. See [`ValueContextFunc`] for the
+    /// expected signature.
+    ContextFunction(ValueContextFunc),
 
     /// Trusted content that bypasses context-aware escaping in its matching
     /// context. Produced by the [`html`](crate::html) module's safe-content
@@ -161,6 +178,7 @@ impl Clone for Value {
             Value::List(v) => Value::List(Arc::clone(v)),
             Value::Map(m) => Value::Map(Arc::clone(m)),
             Value::Function(f) => Value::Function(Arc::clone(f)),
+            Value::ContextFunction(f) => Value::ContextFunction(Arc::clone(f)),
             #[cfg(feature = "html")]
             Value::Safe { kind, s } => Value::Safe {
                 kind: *kind,
@@ -182,6 +200,7 @@ impl fmt::Debug for Value {
             Value::List(v) => write!(f, "List({v:?})"),
             Value::Map(m) => write!(f, "Map({m:?})"),
             Value::Function(_) => write!(f, "Function(...)"),
+            Value::ContextFunction(_) => write!(f, "ContextFunction(...)"),
             #[cfg(feature = "html")]
             Value::Safe { kind, s } => write!(f, "Safe({kind:?}, {s:?})"),
         }
@@ -202,7 +221,7 @@ impl Value {
             Value::String(s) => !s.is_empty(),
             Value::List(v) => !v.is_empty(),
             Value::Map(m) => !m.is_empty(),
-            Value::Function(_) => true,
+            Value::Function(_) | Value::ContextFunction(_) => true,
             #[cfg(feature = "html")]
             Value::Safe { s, .. } => !s.is_empty(),
         }
@@ -318,7 +337,7 @@ impl Value {
             Value::String(_) => "string",
             Value::List(_) => "list",
             Value::Map(_) => "map",
-            Value::Function(_) => "func",
+            Value::Function(_) | Value::ContextFunction(_) => "func",
             // Safe content compares and formats as its underlying string, so it
             // reports "string" (matching Go's basicKind for template.HTML etc.).
             #[cfg(feature = "html")]
@@ -441,9 +460,26 @@ impl Value {
         }
     }
 
-    /// Returns `true` if this is a [`Value::Function`].
+    /// Returns `true` if this is a [`Value::Function`] or [`Value::ContextFunction`].
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Function(_))
+        matches!(self, Value::Function(_) | Value::ContextFunction(_))
+    }
+
+    /// Creates a callable function value from a closure.
+    pub fn func<F>(f: F) -> Self
+    where
+        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        Value::Function(Arc::new(f))
+    }
+
+    /// Creates a context-aware callable function value that receives a [`CallContext`]
+    /// alongside its arguments.
+    pub fn context_func<F>(f: F) -> Self
+    where
+        F: for<'a, 'b> Fn(&CallContext<'a, 'b>, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        Value::ContextFunction(Arc::new(f))
     }
 
     /// Creates a [`Value::Map`] from a fixed-size array of key-value pairs.
@@ -489,7 +525,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Function(_) => write!(f, "<func>"),
+            Value::Function(_) | Value::ContextFunction(_) => write!(f, "<func>"),
             // Trusted content renders verbatim, exactly like its string.
             #[cfg(feature = "html")]
             Value::Safe { s, .. } => write!(f, "{s}"),
